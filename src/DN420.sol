@@ -2,9 +2,21 @@
 pragma solidity ^0.8.4;
 
 /// @title DN420
-/// @notice DN420 is a fully standard compliant, single-contract, 
+/// @notice DN420 is a fully standard compliant, single-contract,
 /// ERC20 and ERC1155 chimera implementation that mints
 /// and burns NFTs based on an account's ERC20 token balance.
+///
+/// On-transfer token ID burning scheme:
+/// - DN420: Largest token ID up to owned checkpoint (inclusive) first.
+/// - DN404: Most recently acquired token ID first.
+///
+/// This implementation uses bitmap scans to find ERC1155 token IDs
+/// to transfer / burn upon ERC20 transfers.
+///
+/// For long-term gas efficiency, please ensure that the maximum
+/// supply of NFTs is bounded and not too big.
+/// 10k is fine, as it costs less than 100k gas to bitmap scan 10k bits.
+/// Otherwise, users can still always call `setOwnedCheckpoint` to unblock.
 ///
 /// @author vectorized.eth (@optimizoor)
 /// @author Quit (@0xQuit)
@@ -23,8 +35,11 @@ abstract contract DN420 {
     /// @dev Emitted when `amount` tokens is approved by `owner` to be used by `spender`.
     event Approval(address indexed owner, address indexed spender, uint256 amount);
 
-    /// @dev Emitted when `target` sets their skipNFT flag to `status`.
-    event SkipNFTSet(address indexed target, bool status);
+    /// @dev Emitted when `owner` sets their skipNFT flag to `status`.
+    event SkipNFTSet(address indexed owner, bool status);
+
+    /// @dev Emitted when `owner` sets their owned checkpoint to `id`.
+    event OwnedCheckpointSet(address indexed owner, uint256 id);
 
     /// @dev Emitted when `amount` of token `id` is transferred
     /// from `from` to `to` by `operator`.
@@ -66,7 +81,7 @@ abstract contract DN420 {
 
     /// @dev `keccak256(bytes("SkipNFTSet(address,bool)"))`.
     uint256 private constant _SKIP_NFT_SET_EVENT_SIGNATURE =
-        0xb5a1de456fff688115a4f75380060c23c8532d14ff85f687cc871456d6420393;
+        0xb5a1de456fff688115a4f75380060c23c8532d14ff85f687cc871456d669393;
 
     /// @dev `keccak256(bytes("TransferSingle(address,address,address,uint256,uint256)"))`.
     uint256 private constant _TRANSFER_SINGLE_EVENT_SIGNATURE =
@@ -87,6 +102,9 @@ abstract contract DN420 {
     /// @dev Thrown when attempting to double-initialize the contract.
     error DNAlreadyInitialized();
 
+    /// @dev The contract has not been initialized.
+    error DNNotInitialized();
+
     /// @dev Thrown when attempting to transfer or burn more tokens than sender's balance.
     error InsufficientBalance();
 
@@ -96,28 +114,31 @@ abstract contract DN420 {
     /// @dev Thrown when minting an amount of tokens that would overflow the max tokens.
     error TotalSupplyOverflow();
 
-    /// @dev The unit cannot be zero.
-    error UnitIsZero();
+    /// @dev The lengths of the input arrays are not the same.
+    error ArrayLengthsMismatch();
+
+    /// @dev The unit must be greater than zero and less than `2**96`.
+    error InvalidUnit();
 
     /// @dev Thrown when attempting to transfer tokens to the zero address.
     error TransferToZeroAddress();
 
-    /// @dev Thrown when setting an NFT token approval
-    /// and the caller is not the owner or an approved operator.
-    error ApprovalCallerNotOwnerNorApproved();
-
     /// @dev Thrown when transferring an NFT
     /// and the caller is not the owner or an approved operator.
-    error TransferCallerNotOwnerNorApproved();
+    error NotOwnerNorApproved();
 
     /// @dev Thrown when transferring an NFT and the from address is not the current owner.
     error TransferFromIncorrectOwner();
 
-    /// @dev Thrown when checking the owner or approved address for a non-existent NFT.
-    error TokenDoesNotExist();
+    /// @dev The amount of ERC1155 NFT transferred per token must be 1.
+    error InvalidNFTAmount();
 
     /// @dev The function selector is not recognized.
     error FnSelectorNotRecognized();
+
+    /// @dev Cannot safely transfer to a contract that does not implement
+    /// the ERC1155Receiver interface.
+    error TransferToNonERC1155ReceiverImplementer();
 
     /*«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-*/
     /*                         CONSTANTS                          */
@@ -149,8 +170,8 @@ abstract contract DN420 {
         uint88 aux;
         // Flags for `initialized` and `skipNFT`.
         uint8 flags;
-        // The upper bound on the NFT IDs owned.
-        uint32 ownedEnd;
+        // The index which to start scanning backwards for burnable / transferable token IDs.
+        uint32 ownedCheckpoint;
         // The number of NFT tokens.
         uint32 ownedCount;
         // The token balance in wei.
@@ -176,6 +197,8 @@ abstract contract DN420 {
     struct DN420Storage {
         // Next NFT ID to assign for a mint.
         uint32 nextTokenId;
+        // The upper bound (inclusive) for token IDs minted thus far.
+        uint32 tokenIdUpTo;
         // Total supply of tokens.
         uint96 totalSupply;
         // Mapping of user operator approvals for NFTs.
@@ -205,14 +228,16 @@ abstract contract DN420 {
 
     /// @dev Initializes the DN420 contract with an
     /// `initialTokenSupply` and `initialTokenOwner`.
-    function _initializeDN420(
-        uint256 initialTokenSupply,
-        address initialSupplyOwner
-    ) internal virtual {
+    function _initializeDN420(uint256 initialTokenSupply, address initialSupplyOwner)
+        internal
+        virtual
+    {
         DN420Storage storage $ = _getDN420Storage();
 
-        if (_unit() == 0) revert UnitIsZero();
-        
+        unchecked {
+            if (_unit() - 1 >= 2 ** 96 - 1) revert InvalidUnit();
+        }
+        if ($.nextTokenId != 0) revert DNAlreadyInitialized();
         $.nextTokenId = 1;
 
         if (initialTokenSupply != 0) {
@@ -220,6 +245,10 @@ abstract contract DN420 {
             if (_totalSupplyOverflows(initialTokenSupply)) revert TotalSupplyOverflow();
 
             $.totalSupply = uint96(initialTokenSupply);
+            unchecked {
+                $.tokenIdUpTo = uint32(initialTokenSupply / _unit());
+            }
+
             AddressData storage initialOwnerAddressData = _addressData(initialSupplyOwner);
             initialOwnerAddressData.balance = uint96(initialTokenSupply);
 
@@ -279,77 +308,80 @@ abstract contract DN420 {
     /*                      ERC20 OPERATIONS                      */
     /*-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»*/
 
-    /// @dev Returns the decimals places of the token. Always 18.
+    /// @dev Returns the decimals places of the ERC20 token. Always 18.
     function decimals() public pure returns (uint8) {
         return 18;
     }
 
-    /// @dev Returns the amount of tokens in existence.
+    /// @dev Returns the amount of ERC20 tokens in existence.
     function totalSupply() public view virtual returns (uint256) {
         return uint256(_getDN420Storage().totalSupply);
     }
 
-    /// @dev Returns the amount of tokens owned by `owner`.
+    /// @dev Returns the amount of ERC20 tokens owned by `owner`.
     function balanceOf(address owner) public view virtual returns (uint256) {
         return _getDN420Storage().addressData[owner].balance;
     }
 
-    /// @dev Returns the amount of tokens that `spender` can spend on behalf of `owner`.
+    /// @dev Returns the amount of ERC20 tokens that `spender` can spend on behalf of `owner`.
     function allowance(address owner, address spender) public view returns (uint256) {
         if (_givePermit2DefaultInfiniteAllowance() && spender == _PERMIT2) {
             uint8 flags = _getDN420Storage().addressData[owner].flags;
-            if (flags & _ADDRESS_DATA_OVERRIDE_PERMIT2_FLAG == 0) return type(uint256).max;
+            if (_isZero(flags & _ADDRESS_DATA_OVERRIDE_PERMIT2_FLAG)) return type(uint256).max;
         }
         return _ref(_getDN420Storage().allowance, owner, spender).value;
     }
 
-    /// @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+    /// @dev Sets `amount` as the allowance of `spender` over the caller's ERC20 tokens.
     ///
-    /// Emits a {Approval} event.
+    /// Emits an ERC20 {Approval} event.
     function approve(address spender, uint256 amount) public virtual returns (bool) {
         _approve(msg.sender, spender, amount);
         return true;
     }
 
-    /// @dev Transfer `amount` tokens from the caller to `to`.
+    /// @dev Transfer `amount` ERC20 tokens from the caller to `to`.
     ///
-    /// Will burn sender NFTs if balance after transfer is less than
+    /// Will burn sender's ERC1155 NFTs if balance after transfer is less than
     /// the amount required to support the current NFT balance.
     ///
-    /// Will mint NFTs to `to` if the recipient's new balance supports
-    /// additional NFTs ***AND*** the `to` address's skipNFT flag is
+    /// Will mint ERC1155 NFTs to `to` if the recipient's new balance supports
+    /// additional ERC1155 NFTs ***AND*** the `to` address's skipNFT flag is
     /// set to false.
     ///
     /// Requirements:
-    /// - `from` must at least have `amount`.
+    /// - `from` must at least have `amount` ERC20 tokens.
     ///
-    /// Emits a {Transfer} event.
+    /// Emits an ERC1155 {TransferBatch} event for direct transfers (if any).
+    /// Emits an ERC1155 {TransferBatch} event for mints (if any).
+    /// Emits an ERC1155 {TransferBatch} event for burns (if any).
+    /// Emits an ERC20 {Transfer} event.
     function transfer(address to, uint256 amount) public virtual returns (bool) {
-        _transfer(msg.sender, to, amount);
+        _transfer(msg.sender, to, amount, "");
         return true;
     }
 
-    /// @dev Transfers `amount` tokens from `from` to `to`.
+    /// @dev Transfers `amount` ERC20 tokens from `from` to `to`.
     ///
-    /// Note: Does not update the allowance if it is the maximum uint256 value.
+    /// Note: Does not update the ERC20 allowance if it is the maximum uint256 value.
     ///
-    /// Will burn sender NFTs if balance after transfer is less than
-    /// the amount required to support the current NFT balance.
+    /// Will burn sender ERC1155 NFTs if balance after transfer is less than
+    /// the amount required to support the current ERC1155 NFT balance.
     ///
-    /// Will mint NFTs to `to` if the recipient's new balance supports
-    /// additional NFTs ***AND*** the `to` address's skipNFT flag is
+    /// Will mint ERC1155 NFTs to `to` if the recipient's new balance supports
+    /// additional ERC1155 NFTs ***AND*** the `to` address's skipNFT flag is
     /// set to false.
     ///
     /// Requirements:
-    /// - `from` must at least have `amount`.
-    /// - The caller must have at least `amount` of allowance to transfer the tokens of `from`.
+    /// - `from` must at least have `amount` ERC20 tokens.
+    /// - The caller must have at least `amount` of ERC20 allowance to transfer the tokens of `from`.
     ///
     /// Emits a {Transfer} event.
     function transferFrom(address from, address to, uint256 amount) public virtual returns (bool) {
         Uint256Ref storage a = _ref(_getDN420Storage().allowance, from, msg.sender);
 
         uint256 allowed = _givePermit2DefaultInfiniteAllowance() && msg.sender == _PERMIT2
-            && (_getDN420Storage().addressData[from].flags & _ADDRESS_DATA_OVERRIDE_PERMIT2_FLAG) == 0
+            && _isZero(_getDN420Storage().addressData[from].flags & _ADDRESS_DATA_OVERRIDE_PERMIT2_FLAG)
             ? type(uint256).max
             : a.value;
 
@@ -359,7 +391,7 @@ abstract contract DN420 {
                 a.value = allowed - amount;
             }
         }
-        _transfer(from, to, amount);
+        _transfer(from, to, amount, "");
         return true;
     }
 
@@ -367,7 +399,7 @@ abstract contract DN420 {
     /*                          PERMIT2                           */
     /*-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»*/
 
-    /// @dev Whether Permit2 has infinite allowances by default for all owners.
+    /// @dev Whether Permit2 has infinite ERC20 allowances by default for all owners.
     /// For signature-based allowance granting for single transaction ERC20 `transferFrom`.
     /// To enable, override this function to return true.
     function _givePermit2DefaultInfiniteAllowance() internal view virtual returns (bool) {
@@ -378,23 +410,25 @@ abstract contract DN420 {
     /*                  INTERNAL MINT FUNCTIONS                   */
     /*-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»*/
 
-    /// @dev Mints `amount` tokens to `to`, increasing the total supply.
+    /// @dev Mints `amount` ERC20 tokens to `to`, increasing the total supply.
     ///
-    /// Will mint NFTs to `to` if the recipient's new balance supports
-    /// additional NFTs ***AND*** the `to` address's skipNFT flag is set to false.
+    /// Will mint ERC1155 NFTs to `to` if the recipient's new balance supports
+    /// additional ERC1155 NFTs ***AND*** the `to` address's skipNFT flag is set to false.
     ///
-    /// Emits a {Transfer} event.
-    function _mint(address to, uint256 amount) internal virtual {
+    /// Emits an ERC1155 {TransferBatch} event for mints (if any).
+    /// Emits an ERC20 {Transfer} event.
+    function _mint(address to, uint256 amount, bytes memory data) internal virtual {
         if (to == address(0)) revert TransferToZeroAddress();
 
         AddressData storage toAddressData = _addressData(to);
         DN420Storage storage $ = _getDN420Storage();
+        if (_isZero($.nextTokenId)) revert DNNotInitialized();
 
-        uint256 toEnd;
+        _DNMintTemps memory t;
         unchecked {
             uint256 toBalance = uint256(toAddressData.balance) + amount;
             toAddressData.balance = uint96(toBalance);
-            toEnd = toBalance / _unit();
+            t.toEnd = toBalance / _unit();
         }
         uint256 maxId;
         unchecked {
@@ -403,31 +437,32 @@ abstract contract DN420 {
             uint256 overflows = _toUint(_totalSupplyOverflows(totalSupply_));
             if (overflows | _toUint(totalSupply_ < amount) != 0) revert TotalSupplyOverflow();
             maxId = totalSupply_ / _unit();
+            $.tokenIdUpTo = uint32(_max($.tokenIdUpTo, maxId));
         }
         unchecked {
-            if (toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG == 0) {
-                uint256 numNFTMints = _zeroFloorSub(toEnd, toAddressData.ownedCount);
-                if (numNFTMints != 0) {
+            if (_isZero(toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG)) {
+                t.mintIds = _idsMalloc(_zeroFloorSub(t.toEnd, toAddressData.ownedCount));
+                if (t.mintIds.length != 0) {
                     Bitmap storage toOwned = $.owned[to];
-                    $.totalNFTSupply += uint32(numNFTMints);
-                    uint256 ownedEnd = toAddressData.ownedEnd;
-                    uint256 nextTokenId = _wrapNFTId($.nextTokenId, maxId);
+                    uint256 ownedCheckpoint = toAddressData.ownedCheckpoint;
+                    uint256 id = _wrapNFTId($.nextTokenId, maxId);
                     // Mint loop.
-                    do {
-                        uint256 id = nextTokenId;
+                    for (uint256 n = t.mintIds.length;;) {
                         while (_get($.exists, id)) {
-                            id = _wrapNFTId(_findFirstUnset($.exists, id + 1, maxId + 1), maxId);
+                            id = _wrapNFTId(_findFirstUnset($.exists, id + 1, maxId), maxId);
                         }
-                        nextTokenId = _wrapNFTId(id + 1, maxId);
                         _set($.exists, id, true);
                         _set(toOwned, id, true);
-                        ownedEnd = _max(ownedEnd, id);
+                        ownedCheckpoint = _max(ownedCheckpoint, id);
+                        _idsAppend(t.mintIds, id);
                         _afterNFTTransfer(address(0), to, id);
-                    } while (--numNFTMints != 0);
-
-                    toAddressData.ownedEnd = uint32(ownedEnd);
-                    toAddressData.ownedCount = uint32(toEnd);
-                    $.nextTokenId = uint32(nextTokenId);
+                        id = _wrapNFTId(id + 1, maxId);
+                        if (_isZero(--n)) break;
+                    }
+                    toAddressData.ownedCheckpoint = uint32(ownedCheckpoint);
+                    toAddressData.ownedCount = uint32(t.toEnd);
+                    $.nextTokenId = uint32(id);
+                    _batchTransferEmit(address(0), to, t.mintIds);
                 }
             }
         }
@@ -437,6 +472,7 @@ abstract contract DN420 {
             mstore(0x00, amount)
             log3(0x00, 0x20, _TRANSFER_EVENT_SIGNATURE, 0, shr(96, shl(96, to)))
         }
+        if (_hasCode(to)) _checkOnERC1155BatchReceived(address(0), to, t.mintIds, data);
     }
 
     /// @dev Mints `amount` tokens to `to`, increasing the total supply.
@@ -446,52 +482,55 @@ abstract contract DN420 {
     /// Will mint NFTs to `to` if the recipient's new balance supports
     /// additional NFTs ***AND*** the `to` address's skipNFT flag is set to false.
     ///
-    /// Emits a {Transfer} event.
-    function _mintNext(address to, uint256 amount) internal virtual {
+    /// Emits an ERC1155 {TransferBatch} event for mints (if any).
+    /// Emits an ERC20 {Transfer} event.
+    function _mintNext(address to, uint256 amount, bytes memory data) internal virtual {
         if (to == address(0)) revert TransferToZeroAddress();
 
         AddressData storage toAddressData = _addressData(to);
         DN420Storage storage $ = _getDN420Storage();
+        if (_isZero($.nextTokenId)) revert DNNotInitialized();
 
-        uint256 toEnd;
-        unchecked {
-            uint256 toBalance = uint256(toAddressData.balance) + amount;
-            toAddressData.balance = uint96(toBalance);
-            toEnd = toBalance / _unit();
-        }
-        uint256 startId;
+        uint256 id;
         uint256 maxId;
         unchecked {
             uint256 preTotalSupply = uint256($.totalSupply);
-            startId = preTotalSupply / _unit() + 1;
+            id = preTotalSupply / _unit() + 1;
             uint256 totalSupply_ = uint256(preTotalSupply) + amount;
             $.totalSupply = uint96(totalSupply_);
             uint256 overflows = _toUint(_totalSupplyOverflows(totalSupply_));
             if (overflows | _toUint(totalSupply_ < amount) != 0) revert TotalSupplyOverflow();
             maxId = totalSupply_ / _unit();
+            $.tokenIdUpTo = uint32(_max($.tokenIdUpTo, maxId));
+        }
+        _DNMintTemps memory t;
+        unchecked {
+            uint256 toBalance = uint256(toAddressData.balance) + amount;
+            toAddressData.balance = uint96(toBalance);
+            t.toEnd = toBalance / _unit();
         }
         unchecked {
-            if (toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG == 0) {
-                uint256 numNFTMints = _zeroFloorSub(toEnd, toAddressData.ownedCount);
-                if (numNFTMints != 0) {
+            if (_isZero(toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG)) {
+                t.mintIds = _idsMalloc(_zeroFloorSub(t.toEnd, toAddressData.ownedCount));
+                if (t.mintIds.length != 0) {
                     Bitmap storage toOwned = $.owned[to];
-                    $.totalNFTSupply += uint32(numNFTMints);
-                    uint256 ownedEnd = toAddressData.ownedEnd;
+                    uint256 ownedCheckpoint = toAddressData.ownedCheckpoint;
                     // Mint loop.
-                    do {
-                        uint256 id = startId;
+                    for (uint256 n = t.mintIds.length;;) {
                         while (_get($.exists, id)) {
-                            id = _wrapNFTId(_findFirstUnset($.exists, id + 1, maxId + 1), maxId);
+                            id = _wrapNFTId(_findFirstUnset($.exists, id + 1, maxId), maxId);
                         }
-                        startId = _wrapNFTId(id + 1, maxId);
                         _set($.exists, id, true);
                         _set(toOwned, id, true);
-                        ownedEnd = _max(ownedEnd, id);
+                        ownedCheckpoint = _max(ownedCheckpoint, id);
+                        _idsAppend(t.mintIds, id);
                         _afterNFTTransfer(address(0), to, id);
-                    } while (--numNFTMints != 0);
-
-                    toAddressData.ownedEnd = uint32(ownedEnd);
-                    toAddressData.ownedCount = uint32(toEnd);
+                        id = _wrapNFTId(id + 1, maxId);
+                        if (_isZero(--n)) break;
+                    }
+                    toAddressData.ownedCheckpoint = uint32(ownedCheckpoint);
+                    toAddressData.ownedCount = uint32(t.toEnd);
+                    _batchTransferEmit(address(0), to, t.mintIds);
                 }
             }
         }
@@ -501,47 +540,52 @@ abstract contract DN420 {
             mstore(0x00, amount)
             log3(0x00, 0x20, _TRANSFER_EVENT_SIGNATURE, 0, shr(96, shl(96, to)))
         }
+        if (_hasCode(to)) _checkOnERC1155BatchReceived(address(0), to, t.mintIds, data);
     }
 
     /*«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-*/
     /*                  INTERNAL BURN FUNCTIONS                   */
     /*-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»*/
 
-    /// @dev Burns `amount` tokens from `from`, reducing the total supply.
+    /// @dev Burns `amount` ERC20 tokens from `from`, reducing the total supply.
     ///
-    /// Will burn sender NFTs if balance after transfer is less than
-    /// the amount required to support the current NFT balance.
+    /// Will burn sender's ERC1155 NFTs if balance after transfer is less than
+    /// the amount required to support the current ERC1155 NFT balance.
     ///
-    /// Emits a {Transfer} event.
+    /// Emits an ERC1155 {TransferBatch} event for burns (if any).
+    /// Emits an ERC20 {Transfer} event.
     function _burn(address from, uint256 amount) internal virtual {
         AddressData storage fromAddressData = _addressData(from);
         DN420Storage storage $ = _getDN420Storage();
+        if (_isZero($.nextTokenId)) revert DNNotInitialized();
 
         uint256 fromBalance = fromAddressData.balance;
         if (amount > fromBalance) revert InsufficientBalance();
 
         unchecked {
             fromAddressData.balance = uint96(fromBalance -= amount);
-            uint256 totalSupply_ = uint256($.totalSupply) - amount;
-            $.totalSupply = uint96(totalSupply_);
+            $.totalSupply -= uint96(amount);
 
             Bitmap storage fromOwned = $.owned[from];
-            uint256 fromIndex = fromAddressData.ownedLength;
+            uint256 fromIndex = fromAddressData.ownedCount;
             uint256 numNFTBurns = _zeroFloorSub(fromIndex, fromBalance / _unit());
 
             if (numNFTBurns != 0) {
-                $.totalNFTSupply -= uint32(numNFTBurns);
-                fromAddressData.ownedLength = uint32(fromIndex - numNFTBurns);
-                uint256 id = fromAddressData.ownedEnd;
+                uint256[] memory ids = _idsMalloc(numNFTBurns);
+                fromAddressData.ownedCount = uint32(fromIndex - numNFTBurns);
+                uint256 id = fromAddressData.ownedCheckpoint;
                 // Burn loop.
-                do {
-                    id = _findLastSet(fromOwned, id + 1);
+                while (true) {
+                    id = _findLastSet(fromOwned, id);
+                    if (_isZero(id)) id = _findLastSet(fromOwned, $.tokenIdUpTo);
                     _set(fromOwned, id, false);
                     _set($.exists, id, false);
                     _afterNFTTransfer(from, address(0), id);
-                } while (--numNFTBurns != 0);
-
-                fromAddressData.ownedEnd = uint32(id);
+                    _idsAppend(ids, id);
+                    if (_isZero(--numNFTBurns)) break;
+                }
+                fromAddressData.ownedCheckpoint = uint32(id);
+                _batchTransferEmit(from, address(0), ids);
             }
         }
         /// @solidity memory-safe-assembly
@@ -556,141 +600,128 @@ abstract contract DN420 {
     /*                INTERNAL TRANSFER FUNCTIONS                 */
     /*-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»*/
 
-    /// @dev Moves `amount` of tokens from `from` to `to`.
+    /// @dev Moves `amount` of ERC20 tokens from `from` to `to`.
     ///
-    /// Will burn sender NFTs if balance after transfer is less than
-    /// the amount required to support the current NFT balance.
+    /// Will burn sender ERC1155 NFTs if balance after transfer is less than
+    /// the amount required to support the current ERC1155 NFT balance.
     ///
-    /// Will mint NFTs to `to` if the recipient's new balance supports
-    /// additional NFTs ***AND*** the `to` address's skipNFT flag is
+    /// Will mint ERC1155 NFTs to `to` if the recipient's new balance supports
+    /// additional ERC1155 NFTs ***AND*** the `to` address's skipNFT flag is
     /// set to false.
-    ///
-    /// Emits a {Transfer} event.
-    function _transfer(address from, address to, uint256 amount) internal virtual {
+    ///.
+    /// Emits an ERC1155 {TransferBatch} event for direct transfers (if any).
+    /// Emits an ERC1155 {TransferBatch} event for mints (if any).
+    /// Emits an ERC1155 {TransferBatch} event for burns (if any).
+    /// Emits an ERC20 {Transfer} event
+    function _transfer(address from, address to, uint256 amount, bytes memory data)
+        internal
+        virtual
+    {
         if (to == address(0)) revert TransferToZeroAddress();
 
         AddressData storage fromAddressData = _addressData(from);
         AddressData storage toAddressData = _addressData(to);
-        DN404Storage storage $ = _getDN420Storage();
-        if ($.mirrorERC721 == address(0)) revert();
+        DN420Storage storage $ = _getDN420Storage();
+        if (_isZero($.nextTokenId)) revert DNNotInitialized();
 
         _DNTransferTemps memory t;
-        t.fromOwnedLength = fromAddressData.ownedLength;
-        t.toOwnedLength = toAddressData.ownedLength;
-        t.totalSupply = $.totalSupply;
-
-        if (amount > (t.fromBalance = fromAddressData.balance)) revert InsufficientBalance();
+        t.fromOwnedCount = fromAddressData.ownedCount;
+        t.toOwnedCount = toAddressData.ownedCount;
 
         unchecked {
-            fromAddressData.balance = uint96(t.fromBalance -= amount);
-            toAddressData.balance = uint96(t.toBalance = uint256(toAddressData.balance) + amount);
+            uint256 toBalance;
+            uint256 fromBalance = fromAddressData.balance;
+            if (amount > fromBalance) revert InsufficientBalance();
 
-            t.numNFTBurns = _zeroFloorSub(t.fromOwnedLength, t.fromBalance / _unit());
+            fromAddressData.balance = uint96(fromBalance -= amount);
+            toAddressData.balance = uint96(toBalance = uint256(toAddressData.balance) + amount);
 
-            if (toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG == 0) {
-                if (from == to) t.toOwnedLength = t.fromOwnedLength - t.numNFTBurns;
-                t.numNFTMints = _zeroFloorSub(t.toBalance / _unit(), t.toOwnedLength);
+            t.numNFTBurns = _zeroFloorSub(t.fromOwnedCount, fromBalance / _unit());
+
+            if (_isZero(toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG)) {
+                if (from == to) t.toOwnedCount = t.fromOwnedCount - t.numNFTBurns;
+                t.numNFTMints = _zeroFloorSub(toBalance / _unit(), t.toOwnedCount);
             }
+        }
 
+        unchecked {
             while (_useDirectTransfersIfPossible()) {
-                uint256 n = _min(t.fromOwnedLength, _min(t.numNFTBurns, t.numNFTMints));
-                if (n == 0) break;
+                uint256 n = _min(t.fromOwnedCount, _min(t.numNFTBurns, t.numNFTMints));
+                if (_isZero(n)) break;
                 t.numNFTBurns -= n;
                 t.numNFTMints -= n;
                 if (from == to) {
-                    t.toOwnedLength += n;
+                    t.toOwnedCount += n;
                     break;
                 }
-                _DNDirectLogs memory directLogs = _directLogsMalloc(n, from, to);
-                Uint32Map storage fromOwned = $.owned[from];
-                Uint32Map storage toOwned = $.owned[to];
-                t.toAlias = _registerAndResolveAlias(toAddressData, to);
-                uint256 toIndex = t.toOwnedLength;
-                // Direct transfer loop.
-                do {
-                    uint256 id = _get(fromOwned, --t.fromOwnedLength);
-                    _set(toOwned, toIndex, uint32(id));
-                    _setOwnerAliasAndOwnedIndex($.oo, id, t.toAlias, uint32(toIndex++));
-                    _directLogsAppend(directLogs, id);
-                    if (_get($.mayHaveNFTApproval, id)) {
-                        _set($.mayHaveNFTApproval, id, false);
-                        delete $.nftApprovals[id];
-                    }
-                    _afterNFTTransfer(from, to, id);
-                } while (--n != 0);
+                t.directIds = _idsMalloc(n);
+                Bitmap storage fromOwned = $.owned[from];
+                Bitmap storage toOwned = $.owned[to];
 
-                toAddressData.ownedLength = uint32(t.toOwnedLength = toIndex);
-                fromAddressData.ownedLength = uint32(t.fromOwnedLength);
-                _directLogsSend(directLogs, $.mirrorERC721);
+                uint256 id = fromAddressData.ownedCheckpoint;
+                fromAddressData.ownedCount = uint32(t.fromOwnedCount -= n);
+                toAddressData.ownedCheckpoint = uint32(_max(toAddressData.ownedCheckpoint, id));
+                toAddressData.ownedCount = uint32(t.toOwnedCount += n);
+                // Direct transfer loop.
+                while (true) {
+                    id = _findLastSet(fromOwned, id);
+                    if (_isZero(id)) id = _findLastSet(fromOwned, $.tokenIdUpTo);
+                    _set(fromOwned, id, false);
+                    _set(toOwned, id, true);
+                    _idsAppend(t.directIds, id);
+                    _afterNFTTransfer(from, to, id);
+                    if (_isZero(--n)) break;
+                }
+                fromAddressData.ownedCheckpoint = uint32(id);
+                _batchTransferEmit(from, to, t.directIds);
                 break;
             }
 
-            t.totalNFTSupply = uint256($.totalNFTSupply) + t.numNFTMints - t.numNFTBurns;
-            $.totalNFTSupply = uint32(t.totalNFTSupply);
-
-            Uint32Map storage oo = $.oo;
-            _DNPackedLogs memory packedLogs = _packedLogsMalloc(t.numNFTBurns + t.numNFTMints);
-
-            t.burnedPoolTail = $.burnedPoolTail;
             if (t.numNFTBurns != 0) {
-                _packedLogsSet(packedLogs, from, 1);
-                bool addToBurnedPool = _addToBurnedPool(t.totalNFTSupply, t.totalSupply);
-                Uint32Map storage fromOwned = $.owned[from];
-                uint256 fromIndex = t.fromOwnedLength;
-                fromAddressData.ownedLength = uint32(t.fromEnd = fromIndex - t.numNFTBurns);
-                uint32 burnedPoolTail = t.burnedPoolTail;
+                uint256 n = t.numNFTBurns;
+                uint256[] memory burnIds = _idsMalloc(n);
+                Bitmap storage fromOwned = $.owned[from];
+                fromAddressData.ownedCount = uint32(t.fromOwnedCount - n);
+                uint256 id = fromAddressData.ownedCheckpoint;
                 // Burn loop.
-                do {
-                    uint256 id = _get(fromOwned, --fromIndex);
-                    _setOwnerAliasAndOwnedIndex(oo, id, 0, 0);
-                    _packedLogsAppend(packedLogs, id);
-                    if (_useExistsLookup()) _set($.exists, id, false);
-                    if (addToBurnedPool) _set($.burnedPool, burnedPoolTail++, uint32(id));
-                    if (_get($.mayHaveNFTApproval, id)) {
-                        _set($.mayHaveNFTApproval, id, false);
-                        delete $.nftApprovals[id];
-                    }
+                while (true) {
+                    id = _findLastSet(fromOwned, id);
+                    if (_isZero(id)) id = _findLastSet(fromOwned, $.tokenIdUpTo);
+                    _set(fromOwned, id, false);
+                    _set($.exists, id, false);
+                    _idsAppend(burnIds, id);
                     _afterNFTTransfer(from, address(0), id);
-                } while (fromIndex != t.fromEnd);
-
-                if (addToBurnedPool) $.burnedPoolTail = (t.burnedPoolTail = burnedPoolTail);
+                    if (_isZero(--n)) break;
+                }
+                fromAddressData.ownedCheckpoint = uint32(id);
+                _batchTransferEmit(from, address(0), burnIds);
             }
 
             if (t.numNFTMints != 0) {
-                _packedLogsSet(packedLogs, to, 0);
-                Uint32Map storage toOwned = $.owned[to];
-                t.toAlias = _registerAndResolveAlias(toAddressData, to);
-                uint256 maxId = t.totalSupply / _unit();
-                t.nextTokenId = _wrapNFTId($.nextTokenId, maxId);
-                uint256 toIndex = t.toOwnedLength;
-                toAddressData.ownedLength = uint32(t.toEnd = toIndex + t.numNFTMints);
-                uint32 burnedPoolHead = $.burnedPoolHead;
+                uint256 n = t.numNFTMints;
+                t.mintIds = _idsMalloc(n);
+                Bitmap storage toOwned = $.owned[to];
+                toAddressData.ownedCount = uint32(t.toOwnedCount + n);
+                uint256 maxId = $.totalSupply / _unit();
+                uint256 id = _wrapNFTId($.nextTokenId, maxId);
+                uint256 ownedCheckpoint = toAddressData.ownedCheckpoint;
                 // Mint loop.
-                do {
-                    uint256 id;
-                    if (burnedPoolHead != t.burnedPoolTail) {
-                        id = _get($.burnedPool, burnedPoolHead++);
-                    } else {
-                        id = t.nextTokenId;
-                        while (_get(oo, _ownershipIndex(id)) != 0) {
-                            id = _useExistsLookup()
-                                ? _wrapNFTId(_findFirstUnset($.exists, id + 1, maxId + 1), maxId)
-                                : _wrapNFTId(id + 1, maxId);
-                        }
-                        t.nextTokenId = _wrapNFTId(id + 1, maxId);
+                while (true) {
+                    while (_get($.exists, id)) {
+                        id = _wrapNFTId(_findFirstUnset($.exists, id + 1, maxId), maxId);
                     }
-                    if (_useExistsLookup()) _set($.exists, id, true);
-                    _set(toOwned, toIndex, uint32(id));
-                    _setOwnerAliasAndOwnedIndex(oo, id, t.toAlias, uint32(toIndex++));
-                    _packedLogsAppend(packedLogs, id);
+                    _set($.exists, id, true);
+                    _set(toOwned, id, true);
+                    ownedCheckpoint = _max(ownedCheckpoint, id);
+                    _idsAppend(t.mintIds, id);
                     _afterNFTTransfer(address(0), to, id);
-                } while (toIndex != t.toEnd);
-
-                $.burnedPoolHead = burnedPoolHead;
-                $.nextTokenId = uint32(t.nextTokenId);
+                    id = _wrapNFTId(id + 1, maxId);
+                    if (_isZero(--n)) break;
+                }
+                toAddressData.ownedCheckpoint = uint32(ownedCheckpoint);
+                $.nextTokenId = uint32(id);
+                _batchTransferEmit(address(0), to, t.mintIds);
             }
-
-            if (packedLogs.logs.length != 0) _packedLogsSend(packedLogs, $.mirrorERC721);
         }
         /// @solidity memory-safe-assembly
         assembly {
@@ -699,79 +730,137 @@ abstract contract DN420 {
             // forgefmt: disable-next-item
             log3(0x00, 0x20, _TRANSFER_EVENT_SIGNATURE, shr(96, shl(96, from)), shr(96, shl(96, to)))
         }
+        if (_hasCode(to)) {
+            _checkOnERC1155BatchReceived(from, to, t.directIds, data);
+            _checkOnERC1155BatchReceived(address(0), to, t.mintIds, data);
+        }
     }
 
-    // /// @dev Transfers token `id` from `from` to `to`.
-    // ///
-    // /// Requirements:
-    // ///
-    // /// - Call must originate from the mirror contract.
-    // /// - Token `id` must exist.
-    // /// - `from` must be the owner of the token.
-    // /// - `to` cannot be the zero address.
-    // ///   `msgSender` must be the owner of the token, or be approved to manage the token.
-    // ///
-    // /// Emits a {Transfer} event.
-    // function _transferFromNFT(address from, address to, uint256 id, address msgSender)
-    //     internal
-    //     virtual
-    // {
-    //     if (to == address(0)) revert TransferToZeroAddress();
+    /// @dev Transfers ERC1155 `id` from `from` to `to`.
+    ///
+    /// Requirements:
+    /// - `to` cannot be the zero address.
+    /// - `from` must have `id`.
+    /// - If `by` is not the zero address, it must be either `from`,
+    ///   or approved to manage the ERC1155 tokens of `from`.
+    /// - If `to` refers to a smart contract, it must implement
+    ///   {ERC1155-onERC1155Reveived}, which is called upon a batch transfer.
+    ///
+    /// Emits an ERC1155 {TransferSingle} event.
+    /// Emits an ERC20 {Transfer} event.
+    function _safeTransferNFT(address by, address from, address to, uint256 id, bytes memory data)
+        internal
+        virtual
+    {
+        if (to == address(0)) revert TransferToZeroAddress();
 
-    //     DN404Storage storage $ = _getDN420Storage();
-    //     if ($.mirrorERC721 == address(0)) revert();
+        DN420Storage storage $ = _getDN420Storage();
+        if (_isZero($.nextTokenId)) revert DNNotInitialized();
 
-    //     Uint32Map storage oo = $.oo;
+        if (_toUint(by == address(0)) | _toUint(by == from) == 0) {
+            if (!isApprovedForAll(from, by)) revert NotOwnerNorApproved();
+        }
 
-    //     if (from != $.aliasToAddress[_get(oo, _ownershipIndex(_restrictNFTId(id)))]) {
-    //         revert TransferFromIncorrectOwner();
-    //     }
+        Bitmap storage fromOwned = $.owned[from];
+        if (!_owns(fromOwned, id)) revert TransferFromIncorrectOwner();
+        _set(fromOwned, id, false);
+        _set($.owned[to], id, true);
 
-    //     if (msgSender != from) {
-    //         if (_ref($.operatorApprovals, from, msgSender).value == 0) {
-    //             if (msgSender != $.nftApprovals[id]) {
-    //                 revert TransferCallerNotOwnerNorApproved();
-    //             }
-    //         }
-    //     }
+        uint256 unit = _unit();
+        AddressData storage fromAddressData = $.addressData[from];
+        AddressData storage toAddressData = $.addressData[to];
+        /// @solidity memory-safe-assembly
+        assembly {
+            let diff := shl(128, or(shl(32, unit), 1))
+            sstore(fromAddressData.slot, sub(sload(fromAddressData.slot), diff))
+            let toPacked := sload(toAddressData.slot)
+            let toCheckpoint := and(0xffffffff, shr(96, toPacked))
+            // forgefmt: disable-next-item
+            sstore(toAddressData.slot, add(diff,
+                xor(toPacked, shl(96, mul(gt(id, toCheckpoint), xor(id, toCheckpoint))))))
+        }
+        _afterNFTTransfer(from, to, id);
+        /// @solidity memory-safe-assembly
+        assembly {
+            from := shr(96, shl(96, from))
+            to := shr(96, shl(96, to))
+            // Emit a {TransferSingle} event.
+            mstore(0x00, id)
+            mstore(0x20, 1)
+            log4(0x00, 0x40, _TRANSFER_SINGLE_EVENT_SIGNATURE, caller(), from, to)
+            // Emit the {Transfer} event.
+            mstore(0x00, unit)
+            log3(0x00, 0x20, _TRANSFER_EVENT_SIGNATURE, from, to)
+        }
+        if (_hasCode(to)) _checkOnERC1155Received(from, to, id, data);
+    }
 
-    //     AddressData storage fromAddressData = _addressData(from);
-    //     AddressData storage toAddressData = _addressData(to);
+    /// @dev Transfers `id` from `from` to `to`.
+    ///
+    /// Requirements:
+    /// - `to` cannot be the zero address.
+    /// - `from` must have `ids`.
+    /// - If `by` is not the zero address, it must be either `from`,
+    ///   or approved to manage the ERC1155 tokens of `from`.
+    /// - If `to` refers to a smart contract, it must implement
+    ///   {ERC1155-onERC1155Reveived}, which is called upon a batch transfer.
+    ///
+    /// Emits an ERC1155 {TransferBatch} event.
+    /// Emits an ERC20 {Transfer} event.
+    function _safeBatchTransferNFTs(
+        address by,
+        address from,
+        address to,
+        uint256[] memory ids,
+        bytes memory data
+    ) internal virtual {
+        if (to == address(0)) revert TransferToZeroAddress();
 
-    //     uint256 unit = _unit();
-    //     mapping(address => Uint32Map) storage owned = $.owned;
-    //     Uint32Map storage fromOwned = owned[from];
+        DN420Storage storage $ = _getDN420Storage();
+        if (_isZero($.nextTokenId)) revert DNNotInitialized();
 
-    //     unchecked {
-    //         uint256 fromBalance = fromAddressData.balance;
-    //         if (unit > fromBalance) revert InsufficientBalance();
-    //         fromAddressData.balance = uint96(fromBalance - unit);
-    //         toAddressData.balance += uint96(unit);
-    //     }
-    //     if (_get($.mayHaveNFTApproval, id)) {
-    //         _set($.mayHaveNFTApproval, id, false);
-    //         delete $.nftApprovals[id];
-    //     }
-    //     unchecked {
-    //         uint32 updatedId = _get(fromOwned, --fromAddressData.ownedLength);
-    //         uint32 i = _get(oo, _ownedIndex(id));
-    //         _set(fromOwned, i, updatedId);
-    //         _set(oo, _ownedIndex(updatedId), i);
-    //     }
-    //     unchecked {
-    //         uint32 n = toAddressData.ownedLength++;
-    //         _set(owned[to], n, uint32(id));
-    //         _setOwnerAliasAndOwnedIndex(oo, id, _registerAndResolveAlias(toAddressData, to), n);
-    //     }
-    //     _afterNFTTransfer(from, to, id);
-    //     /// @solidity memory-safe-assembly
-    //     assembly {
-    //         // Emit the {Transfer} event.
-    //         mstore(0x00, unit)
-    //         // forgefmt: disable-next-item
-    //         log3(0x00, 0x20, _TRANSFER_EVENT_SIGNATURE, shr(96, shl(96, from)), shr(96, shl(96, to)))
-    //     }
-    // }
+        if (_toUint(by == address(0)) | _toUint(by == from) == 0) {
+            if (!isApprovedForAll(from, by)) revert NotOwnerNorApproved();
+        }
+
+        uint256 amount;
+        uint256 upTo;
+        AddressData storage fromAddressData = $.addressData[from];
+        AddressData storage toAddressData = $.addressData[to];
+        unchecked {
+            uint256 n = ids.length;
+            amount = n * _unit();
+            Bitmap storage fromOwned = $.owned[from];
+            Bitmap storage toOwned = $.owned[to];
+            while (n != 0) {
+                uint256 id = _get(ids, --n);
+                if (!_owns(fromOwned, id)) revert TransferFromIncorrectOwner();
+                _set(fromOwned, id, false);
+                _set(toOwned, id, true);
+                _afterNFTTransfer(from, to, id);
+                upTo = _max(upTo, id);
+            }
+        }
+        /// @solidity memory-safe-assembly
+        assembly {
+            let diff := shl(128, or(shl(32, amount), mload(ids)))
+            sstore(fromAddressData.slot, sub(sload(fromAddressData.slot), diff))
+            let toPacked := sload(toAddressData.slot)
+            let toCheckpoint := and(0xffffffff, shr(96, toPacked))
+            // forgefmt: disable-next-item
+            sstore(toAddressData.slot, add(diff,
+                xor(toPacked, shl(96, mul(gt(upTo, toCheckpoint), xor(upTo, toCheckpoint))))))
+        }
+        _batchTransferEmit(from, to, ids);
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Emit the {Transfer} event.
+            mstore(0x00, amount)
+            // forgefmt: disable-next-item
+            log3(0x00, 0x20, _TRANSFER_EVENT_SIGNATURE, shr(96, shl(96, from)), shr(96, shl(96, to)))
+        }
+        if (_hasCode(to)) _checkOnERC1155BatchReceived(from, to, ids, data);
+    }
 
     /*«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-*/
     /*                 INTERNAL APPROVE FUNCTIONS                 */
@@ -862,206 +951,317 @@ abstract contract DN420 {
         }
     }
 
-    // /*«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-*/
-    // /*                     MIRROR OPERATIONS                      */
-    // /*-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»*/
+    /*«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-*/
+    /*                 OWNED CHECKPOINT FUNCTIONS                 */
+    /*-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»*/
 
-    // /// @dev Returns the address of the mirror NFT contract.
-    // function mirrorERC721() public view virtual returns (address) {
-    //     return _getDN420Storage().mirrorERC721;
-    // }
+    /// @dev Returns the owned checkpoint of `owner`.
+    function getOwnedCheckpoint(address owner) public view virtual returns (uint256) {
+        return _getDN420Storage().addressData[owner].ownedCheckpoint;
+    }
 
-    // /// @dev Returns the total NFT supply.
-    // function _totalNFTSupply() internal view virtual returns (uint256) {
-    //     return _getDN420Storage().totalNFTSupply;
-    // }
+    /// @dev Just in case the collection gets too large and the caller needs
+    /// to set their owned checkpoint manually to skip large bitmap scans
+    /// for automatic ERC1155 NFT burns upon ERC20 transfers.
+    function setOwnedCheckpoint(uint256 id) public virtual {
+        _setOwnedCheckpoint(msg.sender, id);
+    }
 
-    // /// @dev Returns `owner` NFT balance.
-    // function _balanceOfNFT(address owner) internal view virtual returns (uint256) {
-    //     return _getDN420Storage().addressData[owner].ownedLength;
-    // }
+    /// @dev Sets the owned checkpoint of `owner` to `id`.
+    /// `id` will be clamped to `[1..tokenIdUpTo]`.
+    function _setOwnedCheckpoint(address owner, uint256 id) internal virtual {
+        DN420Storage storage $ = _getDN420Storage();
+        id = _min(_max(1, id), $.tokenIdUpTo);
+        $.addressData[owner].ownedCheckpoint = uint32(id);
+        emit OwnedCheckpointSet(owner, id);
+    }
 
-    // /// @dev Returns the owner of token `id`.
-    // /// Returns the zero address instead of reverting if the token does not exist.
-    // function _ownerAt(uint256 id) internal view virtual returns (address) {
-    //     DN404Storage storage $ = _getDN420Storage();
-    //     return $.aliasToAddress[_get($.oo, _ownershipIndex(_restrictNFTId(id)))];
-    // }
+    /*«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-*/
+    /*                     ERC1155 OPERATIONS                     */
+    /*-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»*/
 
-    // /// @dev Returns the owner of token `id`.
-    // ///
-    // /// Requirements:
-    // /// - Token `id` must exist.
-    // function _ownerOf(uint256 id) internal view virtual returns (address) {
-    //     if (!_exists(id)) revert TokenDoesNotExist();
-    //     return _ownerAt(id);
-    // }
+    /// @dev Returns if `owner` owns ERC1155 `id`.
+    function owns(address owner, uint256 id) public view virtual returns (bool) {
+        return _owns(_getDN420Storage().owned[owner], id);
+    }
 
-    // /// @dev Returns if token `id` exists.
-    // function _exists(uint256 id) internal view virtual returns (bool) {
-    //     return _ownerAt(id) != address(0);
-    // }
+    /// @dev Returns if the ERC1155 `id` is set in `owned`.
+    function _owns(Bitmap storage owned, uint256 id) internal view virtual returns (bool) {
+        return _get(owned, _restrictNFTId(id));
+    }
 
-    // /// @dev Returns the account approved to manage token `id`.
-    // ///
-    // /// Requirements:
-    // /// - Token `id` must exist.
-    // function _getApproved(uint256 id) internal view virtual returns (address) {
-    //     if (!_exists(id)) revert TokenDoesNotExist();
-    //     return _getDN420Storage().nftApprovals[id];
-    // }
+    /// @dev Returns whether `operator` is approved to manage the ERC1155 tokens of `owner`.
+    function isApprovedForAll(address owner, address operator) public view virtual returns (bool) {
+        return !_isZero(_ref(_getDN420Storage().operatorApprovals, owner, operator).value);
+    }
 
-    // /// @dev Sets `spender` as the approved account to manage token `id`, using `msgSender`.
-    // ///
-    // /// Requirements:
-    // /// - `msgSender` must be the owner or an approved operator for the token owner.
-    // function _approveNFT(address spender, uint256 id, address msgSender)
-    //     internal
-    //     virtual
-    //     returns (address owner)
-    // {
-    //     DN404Storage storage $ = _getDN420Storage();
+    /// @dev Sets whether `operator` is approved to manage the ERC1155 tokens of the caller.
+    ///
+    /// Emits a {ApprovalForAll} event.
+    function setApprovalForAll(address operator, bool isApproved) public virtual {
+        _setApprovalForAll(msg.sender, operator, isApproved);
+    }
 
-    //     owner = $.aliasToAddress[_get($.oo, _ownershipIndex(_restrictNFTId(id)))];
+    /// @dev Sets whether `operator` is approved to manage the ERC1155 tokens of the caller.
+    ///
+    /// Emits a {ApprovalForAll} event.
+    function _setApprovalForAll(address owner, address operator, bool isApproved)
+        internal
+        virtual
+    {
+        _ref(_getDN420Storage().operatorApprovals, owner, operator).value = _toUint(isApproved);
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Emit the {ApprovalForAll} event.
+            mstore(0x00, isApproved)
+            // forgefmt: disable-next-item
+            log3(0x00, 0x20, _APPROVAL_FOR_ALL_EVENT_SIGNATURE,
+                shr(96, shl(96, owner)), shr(96, shl(96, operator)))
+        }
+    }
 
-    //     if (msgSender != owner) {
-    //         if (_ref($.operatorApprovals, owner, msgSender).value == 0) {
-    //             revert ApprovalCallerNotOwnerNorApproved();
-    //         }
-    //     }
+    /// @dev Transfers the ERC1155 NFT at `id` from `from` to `to`.
+    function safeTransferNFT(address from, address to, uint256 id, bytes memory data)
+        public
+        virtual
+    {
+        _safeTransferNFT(msg.sender, from, to, id, data);
+    }
 
-    //     $.nftApprovals[id] = spender;
-    //     _set($.mayHaveNFTApproval, id, spender != address(0));
-    // }
+    /// @dev Transfers the ERC1155 NFTs at `ids` from `from` to `to`.
+    function safeBatchTransferNFTs(
+        address from,
+        address to,
+        uint256[] memory ids,
+        bytes memory data
+    ) public virtual {
+        _safeBatchTransferNFTs(msg.sender, from, to, ids, data);
+    }
 
-    // /// @dev Approve or remove the `operator` as an operator for `msgSender`,
-    // /// without authorization checks.
-    // function _setApprovalForAll(address operator, bool approved, address msgSender)
-    //     internal
-    //     virtual
-    // {
-    //     _ref(_getDN420Storage().operatorApprovals, msgSender, operator).value = _toUint(approved);
-    // }
+    /// @dev Returns true if this contract implements the interface defined by `interfaceId`.
+    /// See: https://eips.ethereum.org/EIPS/eip-165
+    /// This function call must use less than 30000 gas.
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let s := shr(224, interfaceId)
+            // ERC165: 0x01ffc9a7, ERC1155: 0xd9b67a26, ERC1155MetadataURI: 0x0e89341c.
+            result := or(or(eq(s, 0x01ffc9a7), eq(s, 0xd9b67a26)), eq(s, 0x0e89341c))
+        }
+    }
 
-    // /// @dev Returns the NFT IDs of `owner` in range `[begin, end)`.
-    // /// Optimized for smaller bytecode size, as this function is intended for off-chain calling.
-    // function _ownedIds(address owner, uint256 begin, uint256 end)
-    //     internal
-    //     view
-    //     virtual
-    //     returns (uint256[] memory ids)
-    // {
-    //     DN404Storage storage $ = _getDN420Storage();
-    //     Uint32Map storage owned = $.owned[owner];
-    //     uint256 n = _min($.addressData[owner].ownedLength, end);
-    //     /// @solidity memory-safe-assembly
-    //     assembly {
-    //         ids := mload(0x40)
-    //         let i := begin
-    //         for {} lt(i, n) { i := add(i, 1) } {
-    //             let s := add(shl(96, owned.slot), shr(3, i)) // Storage slot.
-    //             let id := and(0xffffffff, shr(shl(5, and(i, 7)), sload(s)))
-    //             mstore(add(add(ids, 0x20), shl(5, sub(i, begin))), id) // Append to.
-    //         }
-    //         mstore(ids, sub(i, begin)) // Store the length.
-    //         mstore(0x40, add(add(ids, 0x20), shl(5, sub(i, begin)))) // Allocate memory.
-    //     }
-    // }
+    /// @dev Returns `owner`'s ERC1155 NFT balance.
+    function _balanceOfNFT(address owner) internal view virtual returns (uint256) {
+        return _getDN420Storage().addressData[owner].ownedCount;
+    }
 
-    // /// @dev Fallback modifier to dispatch calls from the mirror NFT contract
-    // /// to internal functions in this contract.
-    // modifier dn404Fallback() virtual {
-    //     DN404Storage storage $ = _getDN420Storage();
+    /// @dev Returns if the ERC1155 token `id` exists.
+    function _exists(uint256 id) internal view virtual returns (bool) {
+        return _get(_getDN420Storage().exists, _restrictNFTId(id));
+    }
 
-    //     uint256 fnSelector = _calldataload(0x00) >> 224;
-    //     address mirror = $.mirrorERC721;
+    /// @dev Returns the ERC1155 NFT IDs of `owner` in range `[begin, end)`.
+    /// Optimized for smaller bytecode size, as this function is intended for off-chain calling.
+    function _findOwnedIds(address owner, uint256 begin, uint256 end)
+        internal
+        view
+        virtual
+        returns (uint256[] memory ids)
+    {
+        unchecked {
+            DN420Storage storage $ = _getDN420Storage();
+            Bitmap storage owned = $.owned[owner];
+            end = _min(uint256($.tokenIdUpTo) + 1, end);
+            /// @solidity memory-safe-assembly
+            assembly {
+                ids := mload(0x40)
+                let n := 0
+                let s := shl(96, owned.slot)
+                for { let id := begin } lt(id, end) { id := add(1, id) } {
+                    if and(1, shr(and(0xff, id), sload(add(s, shr(8, id))))) {
+                        mstore(add(add(ids, 0x20), shl(5, n)), id)
+                        n := add(1, n)
+                    }
+                }
+                mstore(ids, n)
+                mstore(0x40, add(shl(5, n), add(0x20, ids)))
+            }
+        }
+    }
 
-    //     // `transferFromNFT(address,address,uint256,address)`.
-    //     if (fnSelector == 0xe5eb36c8) {
-    //         if (msg.sender != mirror) revert SenderNotMirror();
-    //         _transferFromNFT(
-    //             address(uint160(_calldataload(0x04))), // `from`.
-    //             address(uint160(_calldataload(0x24))), // `to`.
-    //             _calldataload(0x44), // `id`.
-    //             address(uint160(_calldataload(0x64))) // `msgSender`.
-    //         );
-    //         _return(1);
-    //     }
-    //     // `setApprovalForAll(address,bool,address)`.
-    //     if (fnSelector == 0x813500fc) {
-    //         if (msg.sender != mirror) revert SenderNotMirror();
-    //         _setApprovalForAll(
-    //             address(uint160(_calldataload(0x04))), // `spender`.
-    //             _calldataload(0x24) != 0, // `status`.
-    //             address(uint160(_calldataload(0x44))) // `msgSender`.
-    //         );
-    //         _return(1);
-    //     }
-    //     // `isApprovedForAll(address,address)`.
-    //     if (fnSelector == 0xe985e9c5) {
-    //         if (msg.sender != mirror) revert SenderNotMirror();
-    //         Uint256Ref storage ref = _ref(
-    //             $.operatorApprovals,
-    //             address(uint160(_calldataload(0x04))), // `owner`.
-    //             address(uint160(_calldataload(0x24))) // `operator`.
-    //         );
-    //         _return(ref.value);
-    //     }
-    //     // `ownerOf(uint256)`.
-    //     if (fnSelector == 0x6352211e) {
-    //         if (msg.sender != mirror) revert SenderNotMirror();
-    //         _return(uint160(_ownerOf(_calldataload(0x04))));
-    //     }
-    //     // `ownerAt(uint256)`.
-    //     if (fnSelector == 0x24359879) {
-    //         if (msg.sender != mirror) revert SenderNotMirror();
-    //         _return(uint160(_ownerAt(_calldataload(0x04))));
-    //     }
-    //     // `approveNFT(address,uint256,address)`.
-    //     if (fnSelector == 0xd10b6e0c) {
-    //         if (msg.sender != mirror) revert SenderNotMirror();
-    //         address owner = _approveNFT(
-    //             address(uint160(_calldataload(0x04))), // `spender`.
-    //             _calldataload(0x24), // `id`.
-    //             address(uint160(_calldataload(0x44))) // `msgSender`.
-    //         );
-    //         _return(uint160(owner));
-    //     }
-    //     // `getApproved(uint256)`.
-    //     if (fnSelector == 0x081812fc) {
-    //         if (msg.sender != mirror) revert SenderNotMirror();
-    //         _return(uint160(_getApproved(_calldataload(0x04))));
-    //     }
-    //     // `balanceOfNFT(address)`.
-    //     if (fnSelector == 0xf5b100ea) {
-    //         if (msg.sender != mirror) revert SenderNotMirror();
-    //         _return(_balanceOfNFT(address(uint160(_calldataload(0x04)))));
-    //     }
-    //     // `totalNFTSupply()`.
-    //     if (fnSelector == 0xe2c79281) {
-    //         if (msg.sender != mirror) revert SenderNotMirror();
-    //         _return(_totalNFTSupply());
-    //     }
-    //     // `implementsDN404()`.
-    //     if (fnSelector == 0xb7a94eb8) {
-    //         _return(1);
-    //     }
-    //     _;
-    // }
+    /// @dev Fallback modifier for the regular ERC1155 functions and other functions.
+    modifier dn420Fallback() virtual {
+        uint256 fnSelector = _calldataload(0x00) >> 224;
 
-    // /// @dev Fallback function for calls from mirror NFT contract.
-    // /// Override this if you need to implement your custom
-    // /// fallback with utilities like Solady's `LibZip.cdFallback()`.
-    // /// And always remember to always wrap the fallback with `dn404Fallback`.
-    // fallback() external payable virtual dn404Fallback {
-    //     revert FnSelectorNotRecognized(); // Not mandatory. Just for quality of life.
-    // }
+        // We hide the regular ERC1155 functions that has variable amounts
+        // in the fallback for ABI aesthetic purposes.
 
-    // /// @dev This is to silence the compiler warning.
-    // /// Override and remove the revert if you want your contract to receive ETH via receive.
-    // receive() external payable virtual {
-    //     if (msg.value != 0) revert();
-    // }
+        // `safeTransferFrom(address,address,uint256,uint256,bytes)`.
+        if (fnSelector == 0xf242432a) {
+            if (_calldataload(0x64) != 1) revert InvalidNFTAmount();
+            _safeTransferNFT(
+                msg.sender, // `by`.
+                address(uint160(_calldataload(0x04))), // `from`.
+                address(uint160(_calldataload(0x24))), // `to`.
+                _calldataload(0x44), // `id`.
+                _calldataBytes(0x84) // `data`.
+            );
+            _return(1);
+        }
+        // `safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)`.
+        if (fnSelector == 0x2eb2c2d6) {
+            uint256[] memory ids = _calldataUint256Array(0x44);
+            unchecked {
+                uint256[] memory amounts = _calldataUint256Array(0x64);
+                uint256 n = ids.length;
+                if (n != amounts.length) revert ArrayLengthsMismatch();
+                while (n-- != 0) if (_get(amounts, n) != 1) revert InvalidNFTAmount();
+            }
+            _safeBatchTransferNFTs(
+                msg.sender,
+                address(uint160(_calldataload(0x04))), // `from`.
+                address(uint160(_calldataload(0x24))), // `to`.
+                ids,
+                _calldataBytes(0x84) // `data.
+            );
+            _return(1);
+        }
+        // `balanceOfBatch(address[],uint256[])`.
+        if (fnSelector == 0x4e1273f4) {
+            uint256[] memory owners = _calldataUint256Array(0x04);
+            uint256[] memory ids = _calldataUint256Array(0x24);
+            unchecked {
+                uint256 n = ids.length;
+                if (owners.length != n) revert ArrayLengthsMismatch();
+                uint256[] memory result = _idsMalloc(n);
+                while (n-- != 0) {
+                    address owner = address(uint160(_get(owners, n)));
+                    _set(result, n, _toUint(owns(owner, _get(ids, n))));
+                }
+                /// @solidity memory-safe-assembly
+                assembly {
+                    mstore(sub(result, 0x20), 0x20)
+                    return(sub(result, 0x20), add(0x40, shl(5, mload(result))))
+                }
+            }
+        }
+        // `balanceOf(address,uint256)`.
+        if (fnSelector == 0x00fdd58e) {
+            bool result = owns(
+                address(uint160(_calldataload(0x04))), // `owner`.
+                _calldataload(0x24) // `id`.
+            );
+            _return(_toUint(result));
+        }
+        // `implementsDN420()`.
+        if (fnSelector == 0x0e0b0984) {
+            _return(1);
+        }
+        _;
+    }
+
+    /// @dev Fallback function for regular ERC1155 functions and other functions.
+    /// Override this if you need to implement your custom
+    /// fallback with utilities like Solady's `LibZip.cdFallback()`.
+    /// And always remember to always wrap the fallback with `dn420Fallback`.
+    fallback() external payable virtual dn420Fallback {
+        revert FnSelectorNotRecognized(); // Not mandatory. Just for quality of life.
+    }
+
+    /// @dev This is to silence the compiler warning.
+    /// Override and remove the revert if you want your contract to receive ETH via receive.
+    receive() external payable virtual {
+        if (msg.value != 0) revert();
+    }
+
+    /// @dev Perform a call to invoke {IERC1155Receiver-onERC1155Received} on `to`.
+    /// Reverts if the target does not support the function correctly.
+    function _checkOnERC1155Received(address from, address to, uint256 id, bytes memory data)
+        private
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Prepare the calldata.
+            let m := mload(0x40)
+            // `onERC1155Received(address,address,uint256,uint256,bytes)`.
+            mstore(m, 0xf23a6e61)
+            mstore(add(m, 0x20), caller())
+            mstore(add(m, 0x40), shr(96, shl(96, from)))
+            mstore(add(m, 0x60), id)
+            mstore(add(m, 0x80), 1)
+            mstore(add(m, 0xa0), 0xa0)
+            let n := mload(data)
+            mstore(add(m, 0xc0), n)
+            if n { pop(staticcall(gas(), 4, add(data, 0x20), n, add(m, 0xe0), n)) }
+            // Revert if the call reverts.
+            if iszero(call(gas(), to, 0, add(m, 0x1c), add(0xc4, n), m, 0x20)) {
+                if returndatasize() {
+                    // Bubble up the revert if the call reverts.
+                    returndatacopy(m, 0x00, returndatasize())
+                    revert(m, returndatasize())
+                }
+            }
+            // Load the returndata and compare it with the function selector.
+            if iszero(eq(mload(m), shl(224, 0xf23a6e61))) {
+                mstore(0x00, 0x9c05499b) // `TransferToNonERC1155ReceiverImplementer()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Perform a call to invoke {IERC1155Receiver-onERC1155BatchReceived} on `to`.
+    /// Reverts if the target does not support the function correctly.
+    function _checkOnERC1155BatchReceived(
+        address from,
+        address to,
+        uint256[] memory ids,
+        bytes memory data
+    ) private {
+        if (_isZero(ids.length)) return;
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Prepare the calldata.
+            let m := mload(0x40)
+            // `onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)`.
+            mstore(m, 0xbc197c81)
+            mstore(add(m, 0x20), caller())
+            mstore(add(m, 0x40), shr(96, shl(96, from)))
+            // Copy the `ids`.
+            mstore(add(m, 0x60), 0xa0)
+            let o := add(m, 0xc0)
+            {
+                let n := add(0x20, shl(5, mload(ids)))
+                pop(staticcall(gas(), 4, ids, n, o, n))
+            }
+            // Copy the `amounts`.
+            mstore(add(m, 0x80), add(0xa0, returndatasize()))
+            mstore(add(m, 0xa0), add(returndatasize(), add(0xa0, returndatasize())))
+            o := add(o, returndatasize())
+            mstore(o, mload(ids))
+            let end := add(o, returndatasize())
+            for { o := add(o, 0x20) } iszero(eq(o, end)) { o := add(0x20, o) } { mstore(o, 1) }
+            // Copy the `data`.
+            {
+                let n := add(0x20, mload(data))
+                pop(staticcall(gas(), 4, data, n, end, n))
+            }
+            // Revert if the call reverts.
+            // forgefmt: disable-next-item
+            if iszero(call(gas(), to, 0,
+                add(m, 0x1c), sub(add(end, returndatasize()), add(m, 0x1c)), m, 0x20)) {
+                if returndatasize() {
+                    // Bubble up the revert if the call reverts.
+                    returndatacopy(m, 0x00, returndatasize())
+                    revert(m, returndatasize())
+                }
+            }
+            // Load the returndata and compare it with the function selector.
+            if iszero(eq(mload(m), shl(224, 0xbc197c81))) {
+                mstore(0x00, 0x9c05499b) // `TransferToNonERC1155ReceiverImplementer()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
 
     /*«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-«-*/
     /*                 INTERNAL / PRIVATE HELPERS                 */
@@ -1086,19 +1286,9 @@ abstract contract DN420 {
         }
     }
 
-    /// @dev Returns the index of the most significant set bit in `[0, end)`.
+    /// @dev Returns the index of the least significant unset bit in `[begin..upTo]`.
     /// If no set bit is found, returns `type(uint256).max`.
-    function _findLastSet(Bitmap storage bitmap, uint256 end)
-        internal
-        view
-        returns (uint256 unsetBitIndex)
-    {
-
-    }
-
-    /// @dev Returns the index of the least significant unset bit in `[begin, end)`.
-    /// If no unset bit is found, returns `type(uint256).max`.
-    function _findFirstUnset(Bitmap storage bitmap, uint256 begin, uint256 end)
+    function _findFirstUnset(Bitmap storage bitmap, uint256 begin, uint256 upTo)
         internal
         view
         returns (uint256 unsetBitIndex)
@@ -1108,16 +1298,16 @@ abstract contract DN420 {
             unsetBitIndex := not(0) // Initialize to `type(uint256).max`.
             let s := shl(96, bitmap.slot) // Storage offset of the bitmap.
             let bucket := add(s, shr(8, begin))
+            let lastBucket := add(s, shr(8, upTo))
             let negBits := shl(and(0xff, begin), shr(and(0xff, begin), not(sload(bucket))))
             if iszero(negBits) {
-                let lastBucket := add(s, shr(8, end))
                 for {} 1 {} {
                     bucket := add(bucket, 1)
                     negBits := not(sload(bucket))
                     if or(negBits, gt(bucket, lastBucket)) { break }
                 }
                 if gt(bucket, lastBucket) {
-                    negBits := shr(and(0xff, not(end)), shl(and(0xff, not(end)), negBits))
+                    negBits := shr(and(0xff, not(upTo)), shl(and(0xff, not(upTo)), negBits))
                 }
             }
             if negBits {
@@ -1131,7 +1321,43 @@ abstract contract DN420 {
                 r := or(r, byte(and(div(0xd76453e0, shr(r, b)), 0x1f),
                     0x001f0d1e100c1d070f090b19131c1706010e11080a1a141802121b1503160405))
                 r := or(shl(8, sub(bucket, s)), r)
-                unsetBitIndex := or(r, sub(0, or(iszero(lt(r, end)), lt(r, begin))))
+                unsetBitIndex := or(r, sub(0, or(gt(r, upTo), lt(r, begin))))
+            }
+        }
+    }
+
+    /// @dev Returns the index of the most significant set bit in `[0..upTo]`.
+    /// If no set bit is found, returns zero.
+    function _findLastSet(Bitmap storage bitmap, uint256 upTo)
+        internal
+        view
+        returns (uint256 setBitIndex)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let s := shl(96, bitmap.slot) // Storage offset of the bitmap.
+            let bucket := add(s, shr(8, upTo))
+            let bits := shr(and(0xff, not(upTo)), shl(and(0xff, not(upTo)), sload(bucket)))
+            if iszero(or(bits, eq(bucket, s))) {
+                for {} 1 {} {
+                    bucket := sub(bucket, 1)
+                    mstore(0x00, bucket)
+                    bits := sload(bucket)
+                    if or(bits, eq(bucket, s)) { break }
+                }
+            }
+            if bits {
+                // Find-last-set routine.
+                let r := shl(7, lt(0xffffffffffffffffffffffffffffffff, bits))
+                r := or(r, shl(6, lt(0xffffffffffffffff, shr(r, bits))))
+                r := or(r, shl(5, lt(0xffffffff, shr(r, bits))))
+                r := or(r, shl(4, lt(0xffff, shr(r, bits))))
+                r := or(r, shl(3, lt(0xff, shr(r, bits))))
+                // forgefmt: disable-next-item
+                r := or(r, byte(and(0x1f, shr(shr(r, bits), 0x8421084210842108cc6318c6db6d54be)),
+                    0x0706060506020504060203020504030106050205030304010505030400000000))
+                r := or(shl(8, sub(bucket, s)), r)
+                setBitIndex := mul(r, iszero(gt(r, upTo)))
             }
         }
     }
@@ -1210,29 +1436,78 @@ abstract contract DN420 {
         }
     }
 
-    /// @dev Struct of temporary variables for transfers.
-    struct _DNTransferTemps {
-        uint256 numNFTBurns;
-        uint256 numNFTMints;
-        uint256 fromBalance;
-        uint256 toBalance;
-        uint256 fromOwnedLength;
-        uint256 toOwnedLength;
-        uint256 totalSupply;
-        uint256 totalNFTSupply;
-        uint256 fromEnd;
-        uint256 toEnd;
-        uint32 toAlias;
-        uint256 nextTokenId;
-        uint32 burnedPoolTail;
+    /// @dev Returns `b == 0`. This is because solc is sometimes dumb.
+    function _isZero(uint256 x) internal pure returns (bool result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := iszero(x)
+        }
+    }
+
+    /// @dev Creates an array with length `n` that is suitable for `_idsAppend`.
+    function _idsMalloc(uint256 n) private pure returns (uint256[] memory result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := add(0x20, mload(0x40))
+            let offset := add(result, 0x20)
+            mstore(sub(result, 0x20), offset)
+            mstore(result, n)
+            mstore(0x40, add(offset, shl(5, n)))
+        }
+    }
+
+    /// @dev Appends `id` to `a`. `a` must be created via `_idsMalloc`.
+    function _idsAppend(uint256[] memory a, uint256 id) private pure {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let offset := mload(sub(a, 0x20))
+            mstore(offset, id)
+            mstore(sub(a, 0x20), add(offset, 0x20))
+        }
+    }
+
+    /// @dev Emits a {TransferBatch} event with `from`, `to`, and `ids`.
+    function _batchTransferEmit(address from, address to, uint256[] memory ids) private {
+        if (_isZero(ids.length)) return;
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            mstore(m, 0x40)
+            let o := add(m, 0x40)
+            // We have to copy the `ids`, as it might not be from `_idsMalloc`.
+            // See: `_safeBatchTransferNFTs`.
+            {
+                let n := add(0x20, shl(5, mload(ids)))
+                pop(staticcall(gas(), 4, ids, n, o, n))
+            }
+            mstore(add(m, 0x20), add(0x40, returndatasize()))
+            o := add(o, returndatasize())
+            // Store the length of `amounts`.
+            mstore(o, mload(ids))
+            let end := add(o, returndatasize())
+            for { o := add(o, 0x20) } iszero(eq(o, end)) { o := add(0x20, o) } { mstore(o, 1) }
+            // Emit a {TransferBatch} event.
+            // forgefmt: disable-next-item
+            log4(m, sub(o, m), _TRANSFER_BATCH_EVENT_SIGNATURE, caller(),
+                shr(96, shl(96, from)), shr(96, shl(96, to)))
+        }
     }
 
     /// @dev Struct of temporary variables for mints.
     struct _DNMintTemps {
-        uint256 nextTokenId;
-        uint32 burnedPoolTail;
         uint256 toEnd;
-        uint32 toAlias;
+        uint256[] mintIds;
+    }
+
+    /// @dev Struct of temporary variables for transfers.
+    struct _DNTransferTemps {
+        uint256 numNFTBurns;
+        uint256 numNFTMints;
+        uint256 fromOwnedCount;
+        uint256 toOwnedCount;
+        uint256 ownedCheckpoint;
+        uint256[] directIds;
+        uint256[] mintIds;
     }
 
     /// @dev Returns if `a` has bytecode of non-zero length.
@@ -1240,6 +1515,50 @@ abstract contract DN420 {
         /// @solidity memory-safe-assembly
         assembly {
             result := extcodesize(a) // Can handle dirty upper bits.
+        }
+    }
+
+    /// @dev Returns a `uint256[] calldata` at `offset` in calldata as `uint256[] memory`.
+    function _calldataUint256Array(uint256 offset) private pure returns (uint256[] memory result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := mload(0x40)
+            let o := add(0x04, calldataload(offset))
+            let n := calldataload(o)
+            mstore(result, n)
+            calldatacopy(add(0x20, result), add(o, 0x20), shl(5, n))
+            mstore(0x40, add(add(0x20, result), shl(5, n)))
+        }
+    }
+
+    /// @dev Returns a `bytes calldata` at `offset` in calldata as `bytes memory`.
+    function _calldataBytes(uint256 offset) private pure returns (bytes memory result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := mload(0x40)
+            let o := add(0x04, calldataload(offset))
+            let n := calldataload(o)
+            mstore(result, n)
+            calldatacopy(add(0x20, result), add(o, 0x20), n)
+            o := add(add(0x20, result), n)
+            mstore(o, 0) // Zeroize the slot after the last word.
+            mstore(0x40, add(0x20, o))
+        }
+    }
+
+    /// @dev Returns `a[i]` without bounds check.
+    function _get(uint256[] memory a, uint256 i) private pure returns (uint256 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := mload(add(add(0x20, a), shl(5, i)))
+        }
+    }
+
+    /// @dev Sets `a[i]` to `value`, without bounds check.
+    function _set(uint256[] memory a, uint256 i, uint256 value) private pure {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(add(add(0x20, a), shl(5, i)), value)
         }
     }
 
